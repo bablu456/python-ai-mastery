@@ -3,7 +3,7 @@ import os
 
 
 
-os.environ["GEMENI_API_KEY"] = "AIzaSyAnwgVo7Knoh5Sg8zJzCxLirSqld57Jy7o"
+os.environ["GEMENI_API_KEY"] = ""
 genai.configure(api_key=os.environ["GEMENI_API_KEY"])
 
 def analyze_backend_error(error_log):
