@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RideFlow AI Tracker</title>
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""
+    >
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+
+        .control-panel {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            z-index: 1000;
+            width: min(320px, calc(100vw - 32px));
+            padding: 16px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.95);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+        }
+
+        .control-panel h1 {
+            margin: 0 0 8px;
+            font-size: 1.2rem;
+        }
+
+        .control-panel p {
+            margin: 0 0 12px;
+            color: #444;
+            font-size: 0.92rem;
+            line-height: 1.4;
+        }
+
+        .control-panel label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .control-panel input,
+        .control-panel select,
+        .control-panel button {
+            width: 100%;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            border: 1px solid #cfd6dd;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            box-sizing: border-box;
+        }
+
+        .control-panel button {
+            border: none;
+            background: #111827;
+            color: #ffffff;
+            cursor: pointer;
+        }
+
+        .status {
+            margin: 0;
+            font-size: 0.9rem;
+        }
+
+        .status strong {
+            color: #0f766e;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div class="control-panel">
+        <h1>RideFlow AI</h1>
+        <p>Enter your details, allow location access, and this page will stream your live position over WebSockets.</p>
+
+        <label for="userId">User ID</label>
+        <input id="userId" type="text" placeholder="e.g. driver-101">
+
+        <label for="role">Role</label>
+        <select id="role">
+            <option value="driver">Driver</option>
+            <option value="rider">Rider</option>
+        </select>
+
+        <button id="connectButton">Connect and Share Location</button>
+        <p class="status">Status: <strong id="statusText">Waiting to connect</strong></p>
+    </div>
+
+    <script
+        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""
+    ></script>
+    <script>
+        // Create the map once, then keep updating layers and markers as data arrives.
+        const map = L.map("map").setView([20.5937, 78.9629], 5);
+
+        // OpenStreetMap provides the visible base map tiles.
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "&copy; OpenStreetMap contributors"
+        }).addTo(map);
+
+        const userIdInput = document.getElementById("userId");
+        const roleSelect = document.getElementById("role");
+        const connectButton = document.getElementById("connectButton");
+        const statusText = document.getElementById("statusText");
+
+        let socket = null;
+        let watchId = null;
+        let currentUser = null;
+        let hasCenteredMap = false;
+
+        // Store every visible marker by user_id so repeat updates move the same marker.
+        const markers = {};
+
+        function setStatus(message) {
+            statusText.textContent = message;
+        }
+
+        function createColoredIcon(color) {
+            const svg = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="30" height="42" viewBox="0 0 30 42">
+                    <path d="M15 1C7.82 1 2 6.82 2 14c0 10.2 13 27 13 27s13-16.8 13-27C28 6.82 22.18 1 15 1z"
+                          fill="${color}" stroke="#1f2937" stroke-width="2"/>
+                    <circle cx="15" cy="14" r="5" fill="#ffffff"/>
+                </svg>
+            `;
+
+            return L.icon({
+                iconUrl: "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(svg),
+                iconSize: [30, 42],
+                iconAnchor: [15, 42],
+                popupAnchor: [0, -36]
+            });
+        }
+
+        const driverIcon = createColoredIcon("#dc2626");
+        const riderIcon = createColoredIcon("#2563eb");
+
+        function upsertMarker(locationData) {
+            const { user_id, role, lat, lng } = locationData;
+            const markerIcon = role === "driver" ? driverIcon : riderIcon;
+            const popupText = `${user_id} (${role})`;
+
+            // If we have seen this user before, move the existing marker.
+            if (markers[user_id]) {
+                markers[user_id].setLatLng([lat, lng]);
+                markers[user_id].setIcon(markerIcon);
+                markers[user_id].setPopupContent(popupText);
+                return;
+            }
+
+            // First update for a user: create one marker and remember it for later updates.
+            markers[user_id] = L.marker([lat, lng], { icon: markerIcon })
+                .addTo(map)
+                .bindPopup(popupText);
+        }
+
+        function connectWebSocket() {
+            const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+            socket = new WebSocket(`${wsProtocol}://${window.location.host}/ws/locations`);
+
+            // WebSocket lifecycle:
+            // open -> message exchange -> close/error.
+            socket.addEventListener("open", () => {
+                setStatus("Connected");
+                startLocationTracking();
+            });
+
+            socket.addEventListener("message", (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "error") {
+                    setStatus(data.message);
+                    return;
+                }
+
+                // Remote users are rendered by updating or creating markers on the map.
+                upsertMarker(data);
+            });
+
+            socket.addEventListener("close", () => {
+                setStatus("Disconnected");
+                stopLocationTracking();
+            });
+
+            socket.addEventListener("error", () => {
+                setStatus("WebSocket error");
+            });
+        }
+
+        function startLocationTracking() {
+            if (!navigator.geolocation) {
+                setStatus("Geolocation is not supported in this browser.");
+                return;
+            }
+
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+            }
+
+            // watchPosition keeps sending fresh coordinates whenever the device moves.
+            watchId = navigator.geolocation.watchPosition(
+                (position) => {
+                    const locationPayload = {
+                        user_id: currentUser.user_id,
+                        role: currentUser.role,
+                        lat: position.coords.latitude,
+                        lng: position.coords.longitude
+                    };
+
+                    // Update the current user's marker immediately for instant feedback.
+                    upsertMarker(locationPayload);
+
+                    if (!hasCenteredMap) {
+                        map.setView([locationPayload.lat, locationPayload.lng], 15);
+                        hasCenteredMap = true;
+                    }
+
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify(locationPayload));
+                        setStatus("Sharing live location");
+                    }
+                },
+                (error) => {
+                    setStatus(`Location error: ${error.message}`);
+                },
+                {
+                    enableHighAccuracy: true,
+                    maximumAge: 5000,
+                    timeout: 10000
+                }
+            );
+        }
+
+        function stopLocationTracking() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+        }
+
+        connectButton.addEventListener("click", () => {
+            const userId = userIdInput.value.trim();
+            const role = roleSelect.value;
+
+            if (!userId) {
+                setStatus("Please enter a User ID before connecting.");
+                userIdInput.focus();
+                return;
+            }
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                setStatus("Already connected");
+                return;
+            }
+
+            currentUser = { user_id: userId, role };
+            setStatus("Connecting...");
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>
